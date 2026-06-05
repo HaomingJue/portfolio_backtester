@@ -1,0 +1,30 @@
+{
+  "_comment": "Run: python backtest.py --config portfolios.json",
+  "start": "2003-01-01",
+  "capital": 10000,
+  "rebalance": "quarterly",
+
+  "portfolios": [
+    {
+      "name": "Permanent 2x",
+      "weights": { "SSO": 0.25, "TMF": 0.25, "UGL": 0.25, "SHY": 0.25 },
+      "color": "#E53935"
+    },
+    {
+      "name": "Permanent 1.5x",
+      "weights": { "SSO": 0.125, "TMF": 0.125, "UGL": 0.125, "SHY": 0.25, "SPY": 0.125, "TLT": 0.125, "GLD": 0.125 },
+      "color": "#999999"
+    },
+    {
+      "name": "Permanent Portfolio",
+      "weights": { "SPY": 0.25, "TLT": 0.25, "GLD": 0.25, "SHY": 0.25 },
+      "color": "#1E88E5"
+    },
+    {
+      "name": "S&P 500",
+      "weights": { "SPY": 1.0 },
+      "rebalance": "none",
+      "color": "#757575"
+    }
+  ]
+}

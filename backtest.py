@@ -2,28 +2,46 @@
 """
 backtest.py — general-purpose multi-asset portfolio backtester
 
-Usage examples:
-  # 60/40 QQQ + TQQQ rebalanced monthly
-  python backtest.py --portfolio QQQ:0.6 TQQQ:0.4
+Two modes:
 
-  # HFEA: 55% UPRO + 45% TMF since 2010
-  python backtest.py --portfolio UPRO:0.55 TMF:0.45 --start 2010-01-01
+  Single-portfolio mode (--portfolio):
+    Compare one portfolio against benchmark tickers.
 
-  # Your QQQ strategy vs HFEA vs SPY
-  python backtest.py --portfolio TQQQ:1.0 --benchmark SPY QQQ UPRO --start 2003-01-01
+    python backtest.py --portfolio QQQ:0.6 TQQQ:0.4
+    python backtest.py --portfolio UPRO:0.55 TMF:0.45 --start 2010-01-01
+    python backtest.py --portfolio TQQQ:1.0 --benchmark SPY QQQ --start 2003-01-01
+    python backtest.py --portfolio VTI:0.30 TLT:0.40 IEI:0.15 GLD:0.075 DJP:0.075 \\
+        --rebalance quarterly --start 2007-01-01 --name "All Weather"
 
-  # All Weather-style with quarterly rebalance
-  python backtest.py --portfolio VTI:0.30 TLT:0.40 IEI:0.15 GLD:0.075 DJP:0.075 \
-      --rebalance quarterly --start 2007-01-01 --name "All Weather"
+  Config mode (--config):
+    Compare any number of named portfolios defined in a JSON file.
+
+    python backtest.py --config portfolios.json
+    python backtest.py --config my_custom.json --start 2015-01-01
+
+    JSON format:
+      {
+        "start": "2007-01-01",   // optional, overridden by --start
+        "capital": 10000,        // optional, overridden by --initial
+        "rebalance": "quarterly",// optional, overridden by --rebalance
+        "portfolios": [
+          { "name": "HFEA", "weights": {"UPRO": 0.55, "TMF": 0.45}, "color": "crimson" },
+          { "name": "SPY B&H", "weights": {"SPY": 1.0}, "color": "gray" }
+        ]
+      }
+
+Synthetic pre-inception NAV is auto-built for UPRO, TMF, and UGL so
+backtests can start before those ETFs existed.
 
 Arguments:
   --portfolio   TICKER:WEIGHT pairs (weights must sum to ~1.0)
+  --config      JSON file path defining multiple portfolios
   --start       Start date YYYY-MM-DD  (default: 2003-01-01)
   --end         End date   YYYY-MM-DD  (default: today)
   --rebalance   none | daily | weekly | monthly | quarterly | yearly (default: monthly)
   --initial     Starting value in USD  (default: 10000)
-  --benchmark   Extra tickers to compare against (default: SPY QQQ)
-  --name        Label for the portfolio in output (default: "Portfolio")
+  --benchmark   Extra tickers to compare against (default: SPY QQQ) [--portfolio mode only]
+  --name        Label for the portfolio (default: "Portfolio") [--portfolio mode only]
   --no-plot     Skip chart generation
   --out         Output folder for charts (default: ./output)
 """
@@ -31,8 +49,11 @@ Arguments:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from datetime import datetime, date
+import warnings
+from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -43,29 +64,146 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+warnings.filterwarnings("ignore")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic leveraged ETF NAV
+# ---------------------------------------------------------------------------
+
+_SYNTH_TICKERS = {
+    "UPRO": {"base": "SPY", "L": 3, "mer": 0.0091},
+    "TMF":  {"base": "TLT", "L": 3, "mer": 0.0093},
+    "UGL":  {"base": "GLD", "L": 2, "mer": 0.0095},
+    "TQQQ": {"base": "QQQ", "L": 3, "mer": 0.0086},
+    "SSO":  {"base": "SPY", "L": 2, "mer": 0.0089},
+    "QLD":  {"base": "QQQ", "L": 2, "mer": 0.0095},
+}
+
+AUTO_COLORS = [
+    "#2196F3", "#FF5722", "#4CAF50", "#FF9800", "#9C27B0",
+    "#009688", "#E91E63", "#607D8B", "#795548", "#F44336",
+    "#3F51B5", "#00BCD4",
+]
+
+
+def _synthetic_lev(base: pd.Series, real: pd.Series | None, L: int, annual_mer: float) -> pd.Series:
+    ret       = base.pct_change().fillna(0)
+    var20     = ret.rolling(20).var().fillna(0)
+    daily_mer = annual_mer / 252.0
+
+    first_real = None
+    if real is not None and not real.dropna().empty:
+        common = base.index.intersection(real.dropna().index)
+        if not common.empty:
+            first_real = base.index.get_loc(common[0])
+
+    nav = np.ones(len(base))
+    for i in range(1, len(base)):
+        r = L * ret.values[i] - 0.5 * (L**2 - L) * var20.values[i]
+        if first_real is None or i < first_real:
+            r -= daily_mer
+        nav[i] = nav[i - 1] * (1.0 + r)
+
+    synth = pd.Series(nav, index=base.index, name=base.name)
+    if first_real is None:
+        return synth
+
+    anchor   = base.index[first_real]
+    stitched = synth.copy()
+    real_aln = real.reindex(base.index)
+    stitched.loc[anchor:] = real_aln.loc[anchor:] * (synth.loc[anchor] / real.loc[anchor])
+    return stitched
+
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
 
-def download_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
-    all_tickers = sorted(set(tickers))
-    print(f"Downloading {', '.join(all_tickers)} from {start} to {end} …")
-    raw = yf.download(
-        all_tickers, start=start, end=end,
-        auto_adjust=True, progress=False, multi_level_index=len(all_tickers) > 1,
-    )
-    if len(all_tickers) == 1:
-        closes = pd.DataFrame({"Close": raw["Close"]})
-        closes.columns = all_tickers
-    else:
-        closes = raw["Close"].copy()
+def _dl(ticker: str, start: str, end: str) -> pd.Series:
+    try:
+        s = yf.download(ticker, start=start, end=end,
+                        auto_adjust=True, progress=False)["Close"].squeeze().dropna()
+        s.name = ticker
+        return s
+    except Exception:
+        return pd.Series(dtype=float, name=ticker)
 
-    closes = closes.ffill()
-    missing = [t for t in tickers if t not in closes.columns or closes[t].isna().all()]
+
+def download_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+    all_tickers  = sorted(set(tickers))
+    synth_set    = {t for t in all_tickers if t in _SYNTH_TICKERS}
+    base_needed  = {_SYNTH_TICKERS[t]["base"] for t in synth_set}
+    direct_set   = (set(all_tickers) - synth_set) | base_needed
+
+    # Pull extra history for rolling vol used in synthetic model
+    dl_start = (pd.Timestamp(start) - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
+
+    print(f"Downloading {', '.join(sorted(direct_set))} …")
+    raw_series = {t: _dl(t, dl_start, end) for t in sorted(direct_set)}
+
+    for tk in sorted(synth_set):
+        spec = _SYNTH_TICKERS[tk]
+        base = raw_series.get(spec["base"])
+        if base is not None and not base.empty:
+            real = _dl(tk, dl_start, end)
+            raw_series[tk] = _synthetic_lev(base, real, spec["L"], spec["mer"])
+            print(f"  Built synthetic NAV for {tk}")
+        else:
+            print(f"  WARNING: base {spec['base']} unavailable — cannot build {tk}")
+
+    df = pd.DataFrame(raw_series)
+    df = df[df.index >= start].ffill()
+
+    missing = [t for t in tickers if t not in df.columns or df[t].isna().all()]
     if missing:
         raise ValueError(f"No price data for: {', '.join(missing)}")
-    return closes
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Config file
+# ---------------------------------------------------------------------------
+
+def load_config(path: str) -> tuple:
+    """Return (portfolios_dict, colors_dict, rebalance_map, start, end, capital, rebalance).
+
+    rebalance_map: per-portfolio overrides, e.g. {"SPY B&H": "none"}.
+    Falls back to the top-level "rebalance" value (or CLI flag) for portfolios
+    that don't specify one.
+    """
+    data = json.loads(Path(path).read_text())
+    portfolios:    dict[str, dict] = {}
+    colors:        dict[str, str]  = {}
+    rebalance_map: dict[str, str]  = {}
+
+    entries = data.get("portfolios", {})
+    if isinstance(entries, dict):
+        portfolios = dict(entries)
+    else:
+        for entry in entries:
+            name = entry["name"]
+            portfolios[name] = entry["weights"]
+            if "color" in entry:
+                colors[name] = entry["color"]
+            if "rebalance" in entry:
+                rebalance_map[name] = entry["rebalance"]
+
+    color_idx = len(colors)
+    for name in portfolios:
+        if name not in colors:
+            colors[name] = AUTO_COLORS[color_idx % len(AUTO_COLORS)]
+            color_idx += 1
+
+    return (
+        portfolios,
+        colors,
+        rebalance_map,
+        data.get("start"),
+        data.get("end"),
+        data.get("capital"),
+        data.get("rebalance"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +211,6 @@ def download_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _period_first_dates(index: pd.DatetimeIndex, freq: str) -> set:
-    """Return the first trading date of each calendar period."""
     if freq == "none":
         return {index[0]}
     if freq == "daily":
@@ -100,10 +237,9 @@ def simulate(
     p = prices[tickers].dropna()
 
     rebal_dates = _period_first_dates(p.index, rebalance)
-    daily_ret = p.pct_change().fillna(0)
-
-    holding = w * initial  # dollar amount per ticker
-    values = []
+    daily_ret   = p.pct_change().fillna(0)
+    holding     = w * initial
+    values      = []
 
     for i, dt in enumerate(p.index):
         if i > 0:
@@ -128,60 +264,57 @@ def compute_metrics(values: pd.Series, name: str = "Portfolio", initial: float =
     years = (end - start).days / 365.25
     final = values.iloc[-1]
 
-    cagr = (final / initial) ** (1 / years) - 1
-
-    peak = values.cummax()
-    dd = (values - peak) / peak
-    max_dd = dd.min()
-    max_dd_end = dd.idxmin()
+    cagr    = (final / initial) ** (1 / years) - 1
+    peak    = values.cummax()
+    dd      = (values - peak) / peak
+    max_dd  = dd.min()
+    max_dd_end   = dd.idxmin()
     max_dd_start = values.loc[:max_dd_end].idxmax()
 
     daily_ret = values.pct_change().dropna()
-    vol = daily_ret.std() * np.sqrt(252)
-    sharpe = (cagr - 0.04) / vol if vol > 0 else 0.0  # 4% risk-free
-    calmar = cagr / abs(max_dd) if max_dd != 0 else float("inf")
-
-    # Calendar year returns: compare Jan 1 (or start) to Dec 31 (or end)
-    year_ends = values.resample("YE").last()
-    year_starts = pd.concat([pd.Series([initial], index=[values.index[0]]),
-                             values.resample("YE").last().shift(1)]).dropna()
+    vol       = daily_ret.std() * np.sqrt(252)
+    sharpe    = (cagr - 0.04) / vol if vol > 0 else 0.0
+    calmar    = cagr / abs(max_dd) if max_dd != 0 else float("inf")
 
     annual = {}
-    years_seen = sorted(set(values.index.year))
-    for yr in years_seen:
+    for yr in sorted(set(values.index.year)):
         yr_vals = values[values.index.year == yr]
         if yr_vals.empty:
             continue
-        prev = values[values.index < yr_vals.index[0]]
+        prev      = values[values.index < yr_vals.index[0]]
         start_val = prev.iloc[-1] if not prev.empty else initial
         annual[yr] = yr_vals.iloc[-1] / start_val - 1
 
-    annual_s = pd.Series(annual)
-    worst_yr = annual_s.min()
+    annual_s    = pd.Series(annual)
+    worst_yr    = annual_s.min()
     worst_yr_yr = int(annual_s.idxmin())
-    best_yr = annual_s.max()
-    best_yr_yr = int(annual_s.idxmax())
+    best_yr     = annual_s.max()
+    best_yr_yr  = int(annual_s.idxmax())
+    green_n     = (annual_s > 0).sum()
+    total_n     = len(annual_s)
+    green_years = f"{green_n}/{total_n} ({green_n/total_n*100:.0f}%)"
 
     return {
-        "name": name,
-        "start": start.strftime("%Y-%m-%d"),
-        "end": end.strftime("%Y-%m-%d"),
-        "years": round(years, 1),
-        "initial": initial,
-        "final": final,
-        "cagr": cagr,
-        "vol": vol,
-        "sharpe": sharpe,
-        "calmar": calmar,
-        "max_dd": max_dd,
-        "max_dd_start": max_dd_start.strftime("%Y-%m-%d"),
-        "max_dd_end": max_dd_end.strftime("%Y-%m-%d"),
-        "worst_yr": worst_yr,
-        "worst_yr_yr": worst_yr_yr,
-        "best_yr": best_yr,
-        "best_yr_yr": best_yr_yr,
-        "annual": annual_s,
-        "drawdown": dd,
+        "name":          name,
+        "start":         start.strftime("%Y-%m-%d"),
+        "end":           end.strftime("%Y-%m-%d"),
+        "years":         round(years, 1),
+        "initial":       initial,
+        "final":         final,
+        "cagr":          cagr,
+        "vol":           vol,
+        "sharpe":        sharpe,
+        "calmar":        calmar,
+        "max_dd":        max_dd,
+        "max_dd_start":  max_dd_start.strftime("%Y-%m-%d"),
+        "max_dd_end":    max_dd_end.strftime("%Y-%m-%d"),
+        "worst_yr":      worst_yr,
+        "worst_yr_yr":   worst_yr_yr,
+        "best_yr":       best_yr,
+        "best_yr_yr":    best_yr_yr,
+        "green_years":   green_years,
+        "annual":        annual_s,
+        "drawdown":      dd,
     }
 
 
@@ -190,16 +323,17 @@ def compute_metrics(values: pd.Series, name: str = "Portfolio", initial: float =
 # ---------------------------------------------------------------------------
 
 COLS = [
-    ("CAGR",         "cagr",        "{:+.2%}"),
-    ("Vol (ann)",    "vol",         "{:.2%}"),
-    ("Sharpe",       "sharpe",      "{:.2f}"),
-    ("Calmar",       "calmar",      "{:.2f}"),
-    ("Max DD",       "max_dd",      "{:.2%}"),
-    ("Worst Year",   "worst_yr",    "{:+.2%}"),
-    ("Worst Yr",     "worst_yr_yr", "{:d}"),
-    ("Best Year",    "best_yr",     "{:+.2%}"),
-    ("Best Yr",      "best_yr_yr",  "{:d}"),
-    ("Final Value",  "final",       "${:,.0f}"),
+    ("CAGR",        "cagr",        "{:+.2%}"),
+    ("Vol (ann)",   "vol",         "{:.2%}"),
+    ("Sharpe",      "sharpe",      "{:.2f}"),
+    ("Calmar",      "calmar",      "{:.2f}"),
+    ("Max DD",      "max_dd",      "{:.2%}"),
+    ("Worst Year",  "worst_yr",    "{:+.2%}"),
+    ("Worst Yr",    "worst_yr_yr", "{:d}"),
+    ("Best Year",   "best_yr",     "{:+.2%}"),
+    ("Best Yr",     "best_yr_yr",  "{:d}"),
+    ("Final Value", "final",       "${:,.0f}"),
+    ("Green Years", "green_years", "{}"),
 ]
 
 
@@ -219,13 +353,12 @@ def print_summary(all_metrics: list[dict]) -> None:
                     row.append(str(v))
         rows.append(row)
 
-    # Period row
-    rows.append(["Period"] + [f"{m['start']} to {m['end']}" for m in all_metrics])
-    rows.append(["Years"] + [f"{m['years']}" for m in all_metrics])
+    rows.append(["Period"]     + [f"{m['start']} to {m['end']}" for m in all_metrics])
+    rows.append(["Years"]      + [f"{m['years']}" for m in all_metrics])
     rows.append(["Max DD period"] + [f"{m['max_dd_start']} -> {m['max_dd_end']}" for m in all_metrics])
 
     col_widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
-    sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+    sep     = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
     fmt_row = lambda r: "|" + "|".join(f" {str(v):<{w}} " for v, w in zip(r, col_widths)) + "|"
 
     print()
@@ -243,11 +376,11 @@ def print_annual_table(all_metrics: list[dict]) -> None:
     if not all_years:
         return
 
-    headers = ["Year"] + [m["name"] for m in all_metrics]
+    headers   = ["Year"] + [m["name"] for m in all_metrics]
     col_widths = [max(4, max(len(str(h)) for h in headers))] + [
         max(8, len(m["name"])) for m in all_metrics
     ]
-    sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+    sep     = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
     fmt_row = lambda r: "|" + "|".join(f" {str(v):>{w}} " for v, w in zip(r, col_widths)) + "|"
 
     print("Annual Returns:")
@@ -268,10 +401,6 @@ def print_annual_table(all_metrics: list[dict]) -> None:
 # Charts
 # ---------------------------------------------------------------------------
 
-COLORS = ["#2196F3", "#FF5722", "#4CAF50", "#FF9800", "#9C27B0",
-          "#009688", "#E91E63", "#607D8B", "#795548"]
-
-
 def _dollar_fmt(x, _):
     if x >= 1_000_000:
         return f"${x/1_000_000:.1f}M"
@@ -281,20 +410,13 @@ def _dollar_fmt(x, _):
 
 
 def plot_all(
-    portfolio_values: pd.Series,
-    portfolio_metrics: dict,
-    benchmark_values: dict[str, pd.Series],
-    benchmark_metrics: dict[str, dict],
-    portfolio_name: str,
-    initial: float,
-    out_path: Path,
-    rebalance: str,
-    weights: dict[str, float],
+    all_metrics:  list[dict],
+    all_values:   list[pd.Series],
+    colors:       list[str],
+    rebalance:    str,
+    initial:      float,
+    out_path:     Path,
 ) -> None:
-    all_names = [portfolio_name] + list(benchmark_values.keys())
-    all_series = [portfolio_values] + list(benchmark_values.values())
-    all_metrics = [portfolio_metrics] + list(benchmark_metrics.values())
-
     fig = plt.figure(figsize=(16, 14))
     fig.patch.set_facecolor("#0d1117")
 
@@ -305,10 +427,10 @@ def plot_all(
         left=0.07, right=0.97, top=0.93, bottom=0.06,
     )
 
-    ax_growth  = fig.add_subplot(gs[0, :])
-    ax_dd      = fig.add_subplot(gs[1, :])
-    ax_annual  = fig.add_subplot(gs[2, 0])
-    ax_stats   = fig.add_subplot(gs[2, 1])
+    ax_growth = fig.add_subplot(gs[0, :])
+    ax_dd     = fig.add_subplot(gs[1, :])
+    ax_annual = fig.add_subplot(gs[2, 0])
+    ax_stats  = fig.add_subplot(gs[2, 1])
 
     for ax in [ax_growth, ax_dd, ax_annual, ax_stats]:
         ax.set_facecolor("#161b22")
@@ -317,48 +439,48 @@ def plot_all(
             spine.set_edgecolor("#30363d")
 
     # ── 1. Growth chart ──────────────────────────────────────────────────
-    for i, (name, vals) in enumerate(zip(all_names, all_series)):
-        color = COLORS[i % len(COLORS)]
+    for i, (m, vals) in enumerate(zip(all_metrics, all_values)):
+        color = colors[i]
         lw = 2.5 if i == 0 else 1.5
         ax_growth.plot(vals.index, vals.values, color=color, lw=lw,
-                       label=name, zorder=10 - i)
+                       label=m["name"], zorder=10 - i)
 
     ax_growth.set_yscale("log")
     ax_growth.yaxis.set_major_formatter(mticker.FuncFormatter(_dollar_fmt))
     ax_growth.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax_growth.set_title(
-        f"Growth of ${initial:,.0f}  |  {portfolio_name}  |  rebalance: {rebalance}",
+        f"Growth of ${initial:,.0f}  |  rebalance: {rebalance}  |  "
+        f"{all_metrics[0]['start']} – {all_metrics[0]['end']}",
         color="#c9d1d9", fontsize=12, pad=8,
     )
     ax_growth.legend(
         facecolor="#161b22", edgecolor="#30363d",
-        labelcolor="#c9d1d9", fontsize=8, ncol=min(4, len(all_names)),
+        labelcolor="#c9d1d9", fontsize=8, ncol=min(4, len(all_metrics)),
     )
     ax_growth.grid(True, color="#21262d", lw=0.5, which="major")
     ax_growth.grid(True, color="#161b22", lw=0.3, which="minor")
 
     # ── 2. Drawdown chart ────────────────────────────────────────────────
-    for i, (name, m) in enumerate(zip(all_names, all_metrics)):
-        color = COLORS[i % len(COLORS)]
+    for i, (m, color) in enumerate(zip(all_metrics, colors)):
         lw = 2 if i == 0 else 1
         ax_dd.fill_between(m["drawdown"].index, m["drawdown"].values * 100,
                            alpha=0.25 if i == 0 else 0.1, color=color)
         ax_dd.plot(m["drawdown"].index, m["drawdown"].values * 100,
-                   color=color, lw=lw, label=name)
+                   color=color, lw=lw, label=m["name"])
 
     ax_dd.set_title("Drawdown (%)", color="#c9d1d9", fontsize=10, pad=6)
     ax_dd.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
     ax_dd.legend(facecolor="#161b22", edgecolor="#30363d",
-                 labelcolor="#c9d1d9", fontsize=7, ncol=min(4, len(all_names)))
+                 labelcolor="#c9d1d9", fontsize=7, ncol=min(4, len(all_metrics)))
     ax_dd.grid(True, color="#21262d", lw=0.5)
 
-    # ── 3. Annual returns bar chart (portfolio only) ─────────────────────
-    ann = portfolio_metrics["annual"]
-    years = [int(y) for y in ann.index]
+    # ── 3. Annual returns bar chart (first portfolio) ─────────────────────
+    ann        = all_metrics[0]["annual"]
+    years      = [int(y) for y in ann.index]
     bar_colors = ["#4CAF50" if v >= 0 else "#F44336" for v in ann.values]
     ax_annual.bar(years, ann.values * 100, color=bar_colors, edgecolor="none", width=0.7)
     ax_annual.axhline(0, color="#555", lw=0.8)
-    ax_annual.set_title(f"{portfolio_name} — Annual Returns",
+    ax_annual.set_title(f"{all_metrics[0]['name']} — Annual Returns",
                         color="#c9d1d9", fontsize=10, pad=6)
     ax_annual.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
     ax_annual.tick_params(axis="x", labelrotation=45, labelsize=7)
@@ -366,28 +488,20 @@ def plot_all(
 
     # ── 4. Stats comparison table ─────────────────────────────────────────
     ax_stats.axis("off")
-    table_data = []
-    col_labels = ["Metric"] + [
-        m["name"][:12] for m in all_metrics
-    ]
     stat_rows = [
-        ("CAGR",       lambda m: f"{m['cagr']:+.1%}"),
-        ("Max DD",     lambda m: f"{m['max_dd']:.1%}"),
-        ("Worst Yr",   lambda m: f"{m['worst_yr']:+.1%} ({m['worst_yr_yr']})"),
-        ("Best Yr",    lambda m: f"{m['best_yr']:+.1%} ({m['best_yr_yr']})"),
-        ("Sharpe",     lambda m: f"{m['sharpe']:.2f}"),
-        ("Calmar",     lambda m: f"{m['calmar']:.2f}" if m['calmar'] != float('inf') else "∞"),
-        ("Final",      lambda m: f"${m['final']:,.0f}"),
+        ("CAGR",     lambda m: f"{m['cagr']:+.1%}"),
+        ("Max DD",   lambda m: f"{m['max_dd']:.1%}"),
+        ("Worst Yr", lambda m: f"{m['worst_yr']:+.1%} ({m['worst_yr_yr']})"),
+        ("Best Yr",  lambda m: f"{m['best_yr']:+.1%} ({m['best_yr_yr']})"),
+        ("Sharpe",   lambda m: f"{m['sharpe']:.2f}"),
+        ("Calmar",   lambda m: f"{m['calmar']:.2f}" if m["calmar"] != float("inf") else "∞"),
+        ("Final",    lambda m: f"${m['final']:,.0f}"),
     ]
-    for row_name, fn in stat_rows:
-        row = [row_name] + [fn(m) for m in all_metrics]
-        table_data.append(row)
+    col_labels = ["Metric"] + [m["name"][:12] for m in all_metrics]
+    table_data = [[rname] + [fn(m) for m in all_metrics] for rname, fn in stat_rows]
 
     table = ax_stats.table(
-        cellText=table_data,
-        colLabels=col_labels,
-        loc="center",
-        cellLoc="right",
+        cellText=table_data, colLabels=col_labels, loc="center", cellLoc="right",
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8)
@@ -398,15 +512,10 @@ def plot_all(
         if r == 0:
             cell.set_facecolor("#21262d")
             cell.set_text_props(color="#58a6ff", fontweight="bold")
-        if c == 1 and r > 0:  # portfolio column
+        if c == 1 and r > 0:
             cell.set_facecolor("#1f2d1f" if r % 2 == 0 else "#192119")
 
     ax_stats.set_title("Summary Comparison", color="#c9d1d9", fontsize=10, pad=6)
-
-    # ── Holdings watermark ────────────────────────────────────────────────
-    alloc_str = "  ".join(f"{t} {w:.0%}" for t, w in weights.items())
-    fig.text(0.5, 0.005, f"Holdings: {alloc_str}  |  Backtester — not financial advice",
-             ha="center", fontsize=7, color="#484f58")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -424,18 +533,19 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument(
-        "--portfolio", nargs="+", required=True, metavar="TICKER:WEIGHT",
-        help='e.g. --portfolio QQQ:0.6 TQQQ:0.4',
-    )
-    p.add_argument("--start",     default="2003-01-01", help="Start date YYYY-MM-DD")
-    p.add_argument("--end",       default=date.today().isoformat(), help="End date YYYY-MM-DD")
-    p.add_argument("--rebalance", default="monthly",
+    p.add_argument("--config",    default=None, metavar="FILE",
+                   help="JSON file defining multiple portfolios (see portfolios.json)")
+    p.add_argument("--portfolio", nargs="+", metavar="TICKER:WEIGHT",
+                   help="e.g. --portfolio QQQ:0.6 TQQQ:0.4  (required without --config)")
+    p.add_argument("--start",     default=None, help="Start date YYYY-MM-DD")
+    p.add_argument("--end",       default=None, help="End date YYYY-MM-DD")
+    p.add_argument("--rebalance", default=None,
                    choices=["none", "daily", "weekly", "monthly", "quarterly", "yearly"])
-    p.add_argument("--initial",   type=float, default=10_000, help="Starting value in USD")
+    p.add_argument("--initial",   type=float, default=None, help="Starting value in USD")
     p.add_argument("--benchmark", nargs="*", default=["SPY", "QQQ"],
-                   help="Benchmark tickers (each $initial invested, no rebalancing)")
-    p.add_argument("--name",      default="Portfolio", help="Label for the portfolio")
+                   help="Benchmark tickers [--portfolio mode only]")
+    p.add_argument("--name",      default="Portfolio",
+                   help="Portfolio label [--portfolio mode only]")
     p.add_argument("--no-plot",   action="store_true", help="Skip chart generation")
     p.add_argument("--out",       default="output", help="Output folder for charts")
     return p.parse_args()
@@ -445,88 +555,100 @@ def parse_portfolio(tokens: list[str]) -> dict[str, float]:
     weights = {}
     for token in tokens:
         if ":" not in token:
-            raise ValueError(
-                f"Bad format '{token}'. Use TICKER:WEIGHT, e.g. QQQ:0.6"
-            )
+            raise ValueError(f"Bad format '{token}'. Use TICKER:WEIGHT, e.g. QQQ:0.6")
         ticker, weight_str = token.split(":", 1)
         weights[ticker.upper()] = float(weight_str)
     total = sum(weights.values())
     if abs(total - 1.0) > 0.02:
-        raise ValueError(
-            f"Weights sum to {total:.4f}, must be ~1.0. Got: {weights}"
-        )
+        raise ValueError(f"Weights sum to {total:.4f}, must be ~1.0. Got: {weights}")
     return weights
 
 
 def main() -> int:
     args = parse_args()
 
-    try:
-        weights = parse_portfolio(args.portfolio)
-    except ValueError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    if not args.config and not args.portfolio:
+        print("ERROR: provide --config <file> or --portfolio TICKER:WEIGHT …", file=sys.stderr)
         return 1
 
-    print(f"\nPortfolio  : {args.name}")
-    print(f"Holdings   : {', '.join(f'{t} {w:.1%}' for t, w in weights.items())}")
-    print(f"Period     : {args.start} to {args.end}")
-    print(f"Rebalance  : {args.rebalance}")
-    print(f"Benchmarks : {', '.join(args.benchmark) if args.benchmark else '(none)'}")
+    # ── Build portfolio list ──────────────────────────────────────────────
+    if args.config:
+        portfolios, color_map, rebalance_map, cfg_start, cfg_end, cfg_capital, cfg_rebalance = load_config(args.config)
+        start     = args.start    or cfg_start    or "2003-01-01"
+        end       = args.end      or cfg_end      or date.today().isoformat()
+        initial   = args.initial  or cfg_capital  or 10_000
+        rebalance = args.rebalance or cfg_rebalance or "quarterly"
+        print(f"Loaded {len(portfolios)} portfolio(s) from {args.config}")
+        all_tickers = list({t for w in portfolios.values() for t in w})
+    else:
+        rebalance_map = {}
+        try:
+            port_weights = parse_portfolio(args.portfolio)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        start     = args.start    or "2003-01-01"
+        end       = args.end      or date.today().isoformat()
+        initial   = args.initial  or 10_000
+        rebalance = args.rebalance or "monthly"
+        portfolios = {args.name: port_weights}
+        color_map  = {args.name: AUTO_COLORS[0]}
+        for i, bm in enumerate(args.benchmark or []):
+            portfolios[bm] = {bm: 1.0}
+            color_map[bm]  = AUTO_COLORS[(i + 1) % len(AUTO_COLORS)]
+        all_tickers = list({t for w in portfolios.values() for t in w})
+
+    print(f"\nPeriod    : {start} → {end}")
+    print(f"Capital   : ${initial:,.0f}")
+    print(f"Rebalance : {rebalance}")
     print()
 
-    all_tickers = list(weights.keys()) + (args.benchmark or [])
+    # ── Download data ─────────────────────────────────────────────────────
     try:
-        prices = download_prices(all_tickers, args.start, args.end)
+        prices = download_prices(all_tickers, start, end)
     except Exception as e:
         print(f"ERROR downloading data: {e}", file=sys.stderr)
         return 1
 
-    # Align start date to first date where ALL portfolio tickers have data
-    portfolio_tickers = list(weights.keys())
-    first_valid = prices[portfolio_tickers].dropna().index[0]
-    if str(first_valid.date()) > args.start:
-        print(f"NOTE: Data starts {first_valid.date()} (latest first-available among {portfolio_tickers})")
-    prices = prices.loc[first_valid:]
+    # ── Simulate ──────────────────────────────────────────────────────────
+    all_metrics: list[dict]      = []
+    all_values:  list[pd.Series] = []
+    colors:      list[str]       = []
 
-    # Simulate portfolio
-    port_vals = simulate(prices, weights, rebalance=args.rebalance, initial=args.initial)
-    port_metrics = compute_metrics(port_vals, name=args.name, initial=args.initial)
-
-    # Simulate benchmarks (buy-and-hold, no rebalancing)
-    bench_vals: dict[str, pd.Series] = {}
-    bench_metrics: dict[str, dict] = {}
-    for ticker in (args.benchmark or []):
-        if ticker not in prices.columns:
-            print(f"WARNING: {ticker} not available, skipping benchmark")
+    for name, weights in portfolios.items():
+        missing = [t for t in weights if t not in prices.columns or prices[t].isna().all()]
+        if missing:
+            print(f"  {name}: skipped — missing data for {missing}")
             continue
-        bvals = simulate(prices, {ticker: 1.0}, rebalance="none", initial=args.initial)
-        bench_vals[ticker] = bvals
-        bench_metrics[ticker] = compute_metrics(bvals, name=ticker, initial=args.initial)
 
-    # Print results
-    all_m = [port_metrics] + list(bench_metrics.values())
-    print_summary(all_m)
-    print_annual_table(all_m)
+        rb = rebalance_map.get(name, rebalance)
+        vals = simulate(prices, weights, rebalance=rb, initial=initial)
+        if vals.empty:
+            continue
 
-    # Chart
+        m = compute_metrics(vals, name=name, initial=initial)
+        all_metrics.append(m)
+        all_values.append(vals)
+        colors.append(color_map.get(name, AUTO_COLORS[len(colors) % len(AUTO_COLORS)]))
+        print(f"  {name}: {m['cagr']:+.2%} CAGR  |  {m['max_dd']:.1%} max DD  |  Sharpe {m['sharpe']:.2f}")
+
+    if not all_metrics:
+        print("ERROR: no portfolios ran successfully", file=sys.stderr)
+        return 1
+
+    # ── Print results ─────────────────────────────────────────────────────
+    print_summary(all_metrics)
+    print_annual_table(all_metrics)
+
+    # ── Chart ─────────────────────────────────────────────────────────────
     if not args.no_plot:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name_slug = args.name.replace(" ", "_").lower()
-        chart_path = Path(args.out) / f"{name_slug}_{ts}.png"
+        ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug      = all_metrics[0]["name"].replace(" ", "_").lower()
+        out_path  = Path(args.out) / f"{slug}_{ts}.png"
         try:
-            plot_all(
-                portfolio_values=port_vals,
-                portfolio_metrics=port_metrics,
-                benchmark_values=bench_vals,
-                benchmark_metrics=bench_metrics,
-                portfolio_name=args.name,
-                initial=args.initial,
-                out_path=chart_path,
-                rebalance=args.rebalance,
-                weights=weights,
-            )
+            plot_all(all_metrics, all_values, colors, rebalance, initial, out_path)
         except Exception as e:
-            print(f"WARNING: Chart generation failed: {e}")
+            print(f"WARNING: chart generation failed: {e}")
 
     return 0
 
