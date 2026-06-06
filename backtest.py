@@ -6,32 +6,43 @@ Two modes:
 
   Single-portfolio mode (--portfolio):
     Compare one portfolio against benchmark tickers.
+    Note: synthetic leveraged ETF NAV requires --config mode.
 
-    python backtest.py --portfolio QQQ:0.6 TQQQ:0.4
-    python backtest.py --portfolio UPRO:0.55 TMF:0.45 --start 2010-01-01
-    python backtest.py --portfolio TQQQ:1.0 --benchmark SPY QQQ --start 2003-01-01
+    python backtest.py --portfolio SPY:0.60 TLT:0.40
+    python backtest.py --portfolio SPY:0.25 TLT:0.25 GLD:0.25 SHY:0.25 --start 2007-01-01
     python backtest.py --portfolio VTI:0.30 TLT:0.40 IEI:0.15 GLD:0.075 DJP:0.075 \\
         --rebalance quarterly --start 2007-01-01 --name "All Weather"
 
   Config mode (--config):
     Compare any number of named portfolios defined in a JSON file.
+    Define synthetic leveraged ETFs in the "instruments" section.
 
     python backtest.py --config portfolios.json
     python backtest.py --config my_custom.json --start 2015-01-01
 
     JSON format:
       {
-        "start": "2007-01-01",   // optional, overridden by --start
-        "capital": 10000,        // optional, overridden by --initial
-        "rebalance": "quarterly",// optional, overridden by --rebalance
+        "start": "2003-01-01",      // optional, overridden by --start
+        "end":   "2024-12-31",      // optional, overridden by --end
+        "capital": 10000,           // optional, overridden by --initial
+        "rebalance": "quarterly",   // optional, overridden by --rebalance
+
+        "instruments": [
+          { "ticker": "SSO",  "base": "SPY", "leverage": 2, "mer": 0.0089 },
+          { "ticker": "TMF",  "base": "TLT", "leverage": 3, "mer": 0.0093 }
+        ],
+
         "portfolios": [
-          { "name": "HFEA", "weights": {"UPRO": 0.55, "TMF": 0.45}, "color": "crimson" },
+          { "name": "HFEA", "weights": {"SSO": 0.55, "TMF": 0.45}, "color": "crimson" },
           { "name": "SPY B&H", "weights": {"SPY": 1.0}, "color": "gray" }
         ]
       }
 
-Synthetic pre-inception NAV is auto-built for UPRO, TMF, and UGL so
-backtests can start before those ETFs existed.
+    Each entry in "instruments" tells the backtester to build synthetic pre-inception
+    NAV for that ticker using a daily-reset model:
+      daily_return = L * base_return - 0.5*(L^2 - L)*variance_20d - MER/252
+    Real prices are used from the ETF's first trading day onward; synthetic data
+    fills in every day before that, going all the way back to the base ETF's history.
 
 Arguments:
   --portfolio   TICKER:WEIGHT pairs (weights must sum to ~1.0)
@@ -70,15 +81,6 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Synthetic leveraged ETF NAV
 # ---------------------------------------------------------------------------
-
-_SYNTH_TICKERS = {
-    "UPRO": {"base": "SPY", "L": 3, "mer": 0.0091},
-    "TMF":  {"base": "TLT", "L": 3, "mer": 0.0093},
-    "UGL":  {"base": "GLD", "L": 2, "mer": 0.0095},
-    "TQQQ": {"base": "QQQ", "L": 3, "mer": 0.0086},
-    "SSO":  {"base": "SPY", "L": 2, "mer": 0.0089},
-    "QLD":  {"base": "QQQ", "L": 2, "mer": 0.0095},
-}
 
 AUTO_COLORS = [
     "#2196F3", "#FF5722", "#4CAF50", "#FF9800", "#9C27B0",
@@ -130,25 +132,39 @@ def _dl(ticker: str, start: str, end: str) -> pd.Series:
         return pd.Series(dtype=float, name=ticker)
 
 
-def download_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+def download_prices(
+    tickers: list[str],
+    start: str,
+    end: str,
+    synth_tickers: dict | None = None,
+) -> pd.DataFrame:
+    """Download price data, building synthetic pre-inception NAV for any ticker
+    defined in synth_tickers (parsed from the JSON "instruments" section).
+
+    synth_tickers format: {"SSO": {"base": "SPY", "L": 2, "mer": 0.0089}, ...}
+    """
+    if synth_tickers is None:
+        synth_tickers = {}
+
     all_tickers  = sorted(set(tickers))
-    synth_set    = {t for t in all_tickers if t in _SYNTH_TICKERS}
-    base_needed  = {_SYNTH_TICKERS[t]["base"] for t in synth_set}
+    synth_set    = {t for t in all_tickers if t in synth_tickers}
+    base_needed  = {synth_tickers[t]["base"] for t in synth_set}
     direct_set   = (set(all_tickers) - synth_set) | base_needed
 
-    # Pull extra history for rolling vol used in synthetic model
+    # Pull extra history for the 20-day rolling variance used in synthetic model
     dl_start = (pd.Timestamp(start) - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
 
     print(f"Downloading {', '.join(sorted(direct_set))} …")
     raw_series = {t: _dl(t, dl_start, end) for t in sorted(direct_set)}
 
     for tk in sorted(synth_set):
-        spec = _SYNTH_TICKERS[tk]
+        spec = synth_tickers[tk]
         base = raw_series.get(spec["base"])
         if base is not None and not base.empty:
             real = _dl(tk, dl_start, end)
             raw_series[tk] = _synthetic_lev(base, real, spec["L"], spec["mer"])
-            print(f"  Built synthetic NAV for {tk}")
+            real_start = real.dropna().index[0].strftime("%Y-%m-%d") if not real.dropna().empty else "no real data"
+            print(f"  Built synthetic NAV for {tk} (real data from {real_start})")
         else:
             print(f"  WARNING: base {spec['base']} unavailable — cannot build {tk}")
 
@@ -166,7 +182,10 @@ def download_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> tuple:
-    """Return (portfolios_dict, colors_dict, rebalance_map, start, end, capital, rebalance).
+    """Return (portfolios_dict, colors_dict, rebalance_map, synth_tickers, start, end, capital, rebalance).
+
+    synth_tickers: dict built from the JSON "instruments" array, keyed by ticker symbol.
+      e.g. {"SSO": {"base": "SPY", "L": 2, "mer": 0.0089}}
 
     rebalance_map: per-portfolio overrides, e.g. {"SPY B&H": "none"}.
     Falls back to the top-level "rebalance" value (or CLI flag) for portfolios
@@ -176,7 +195,22 @@ def load_config(path: str) -> tuple:
     portfolios:    dict[str, dict] = {}
     colors:        dict[str, str]  = {}
     rebalance_map: dict[str, str]  = {}
+    synth_tickers: dict[str, dict] = {}
 
+    # Parse instruments.
+    # - Has base + leverage + mer  →  synthetic pre-inception NAV is built.
+    # - Has only mer (no base/leverage)  →  downloaded directly from Yahoo; mer is informational.
+    # - Not listed at all  →  downloaded directly from Yahoo.
+    for inst in data.get("instruments", []):
+        tk = inst["ticker"].upper()
+        if "base" in inst and "leverage" in inst and "mer" in inst:
+            synth_tickers[tk] = {
+                "base": inst["base"].upper(),
+                "L":    inst["leverage"],
+                "mer":  inst["mer"],
+            }
+
+    # Parse portfolios
     entries = data.get("portfolios", {})
     if isinstance(entries, dict):
         portfolios = dict(entries)
@@ -199,6 +233,7 @@ def load_config(path: str) -> tuple:
         portfolios,
         colors,
         rebalance_map,
+        synth_tickers,
         data.get("start"),
         data.get("end"),
         data.get("capital"),
@@ -573,15 +608,19 @@ def main() -> int:
 
     # ── Build portfolio list ──────────────────────────────────────────────
     if args.config:
-        portfolios, color_map, rebalance_map, cfg_start, cfg_end, cfg_capital, cfg_rebalance = load_config(args.config)
+        portfolios, color_map, rebalance_map, synth_tickers, cfg_start, cfg_end, cfg_capital, cfg_rebalance = load_config(args.config)
         start     = args.start    or cfg_start    or "2003-01-01"
         end       = args.end      or cfg_end      or date.today().isoformat()
         initial   = args.initial  or cfg_capital  or 10_000
         rebalance = args.rebalance or cfg_rebalance or "quarterly"
+        if synth_tickers:
+            inst_summary = ", ".join(f"{t} ({v['L']}x {v['base']})" for t, v in synth_tickers.items())
+            print(f"Instruments: {inst_summary}")
         print(f"Loaded {len(portfolios)} portfolio(s) from {args.config}")
         all_tickers = list({t for w in portfolios.values() for t in w})
     else:
         rebalance_map = {}
+        synth_tickers = {}
         try:
             port_weights = parse_portfolio(args.portfolio)
         except ValueError as e:
@@ -605,7 +644,7 @@ def main() -> int:
 
     # ── Download data ─────────────────────────────────────────────────────
     try:
-        prices = download_prices(all_tickers, start, end)
+        prices = download_prices(all_tickers, start, end, synth_tickers)
     except Exception as e:
         print(f"ERROR downloading data: {e}", file=sys.stderr)
         return 1

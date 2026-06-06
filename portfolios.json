@@ -1,8 +1,24 @@
 {
   "_comment": "Run: python backtest.py --config portfolios.json",
   "start": "2003-01-01",
+  "end": null,
   "capital": 10000,
   "rebalance": "quarterly",
+
+  "instruments": [
+    { "ticker": "SPY", "mer": 0.0009 },
+    { "ticker": "QQQ", "mer": 0.0020 },
+    { "ticker": "TLT", "mer": 0.0015 },
+    { "ticker": "GLD", "mer": 0.0040 },
+    { "ticker": "SHY", "mer": 0.0015 },
+
+    { "ticker": "SSO",  "base": "SPY", "leverage": 2, "mer": 0.0089 },
+    { "ticker": "UPRO", "base": "SPY", "leverage": 3, "mer": 0.0091 },
+    { "ticker": "TMF",  "base": "TLT", "leverage": 3, "mer": 0.0093 },
+    { "ticker": "UGL",  "base": "GLD", "leverage": 2, "mer": 0.0095 },
+    { "ticker": "TQQQ", "base": "QQQ", "leverage": 3, "mer": 0.0086 },
+    { "ticker": "QLD",  "base": "QQQ", "leverage": 2, "mer": 0.0095 }
+  ],
 
   "portfolios": [
     {

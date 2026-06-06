@@ -48,13 +48,19 @@ python backtest.py --portfolio SPY:0.25 TLT:0.25 GLD:0.25 SHY:0.25 \
 ```json
 {
   "start": "2003-01-01",
+  "end": null,
   "capital": 10000,
   "rebalance": "quarterly",
+
+  "instruments": [
+    { "ticker": "SSO",  "base": "SPY", "leverage": 2, "mer": 0.0089 },
+    { "ticker": "TMF",  "base": "TLT", "leverage": 3, "mer": 0.0093 }
+  ],
 
   "portfolios": [
     {
       "name": "My Portfolio",
-      "weights": { "SPY": 0.60, "TLT": 0.40 },
+      "weights": { "SSO": 0.60, "TMF": 0.40 },
       "color": "#1E88E5",
       "rebalance": "monthly"
     },
@@ -67,14 +73,50 @@ python backtest.py --portfolio SPY:0.25 TLT:0.25 GLD:0.25 SHY:0.25 \
 }
 ```
 
+### Top-level fields
+
+| Field | Required | Description |
+|---|---|---|
+| `start` | No | Backtest start date (default: 2003-01-01) |
+| `end` | No | Backtest end date (default: today). Set to `null` for today. |
+| `capital` | No | Starting capital in USD (default: 10000) |
+| `rebalance` | No | Default rebalance frequency for all portfolios |
+
+All top-level fields can be overridden by CLI flags (`--start`, `--end`, `--initial`, `--rebalance`).
+
+### `instruments` — ticker metadata (optional section)
+
+The `instruments` section is optional. Two modes:
+
+**Normal ETF** — just record the MER, download prices normally from Yahoo:
+```json
+{ "ticker": "SPY", "mer": 0.0009 }
+```
+Prices are downloaded directly. If Yahoo has no data before a certain date, the backtest simply starts from the first available day.
+
+**Leveraged / synthetic ETF** — provide `base`, `leverage`, and `mer` to build pre-inception NAV:
+```json
+{ "ticker": "SSO", "base": "SPY", "leverage": 2, "mer": 0.0089 }
+```
+Synthetic history is built going back to the base ETF's first available date. Real prices are used from the ETF's actual inception date onward.
+
+| Field | Required for synth | Description |
+|---|---|---|
+| `ticker` | Yes | Symbol to use in portfolio weights |
+| `base` | Synth only | Underlying index ETF (e.g. `"SPY"`) |
+| `leverage` | Synth only | Daily leverage multiplier (e.g. `2` or `3`) |
+| `mer` | Yes | Annual management expense ratio as a decimal (e.g. `0.0089` = 0.89%) |
+
+Any ticker not listed in `instruments` is downloaded directly from Yahoo Finance and starts from its first available trading day.
+
+### `portfolios` fields
+
 | Field | Required | Description |
 |---|---|---|
 | `name` | Yes | Label shown in output and charts |
 | `weights` | Yes | Ticker → allocation (must sum to ~1.0) |
 | `color` | No | Hex color for charts (auto-assigned if omitted) |
 | `rebalance` | No | Per-portfolio override of the global rebalance setting |
-
-Top-level fields (`start`, `capital`, `rebalance`) can all be overridden by CLI flags.
 
 ### Rebalance options
 
@@ -91,24 +133,31 @@ Top-level fields (`start`, `capital`, `rebalance`) can all be overridden by CLI 
 
 ## Leveraged ETF Synthetic NAV
 
-The following leveraged ETFs are extended backwards before their inception date using a daily-reset NAV model (`L × base_return − vol_drag − MER`). Real ETF prices are used from inception onward.
+Leveraged ETFs are defined in the `"instruments"` section of your JSON config. There are no hardcoded tickers — you control which ETFs get synthetic history and with what parameters.
 
-| Ticker | Base | Leverage | MER |
-|---|---|---|---|
-| UPRO | SPY | 3× | 0.91% |
-| SSO | SPY | 2× | 0.89% |
-| TQQQ | QQQ | 3× | 0.86% |
-| QLD | QQQ | 2× | 0.95% |
-| TMF | TLT | 3× | 0.93% |
-| UGL | GLD | 2× | 0.95% |
+The daily-reset NAV model used for synthetic data:
 
-Any other ticker is downloaded directly from Yahoo Finance. If it has no data before its IPO/inception, the entire portfolio simulation starts from that ticker's first available date.
-
-To add a new leveraged ETF, add an entry to `_SYNTH_TICKERS` in `backtest.py`:
-
-```python
-"SPXL": {"base": "SPY", "L": 3, "mer": 0.0102},
 ```
+daily_return = L × base_return − 0.5 × (L² − L) × variance_20d − MER/252
+```
+
+Real prices are used from the ETF's inception date onward. Synthetic data fills in every day before that, going as far back as the base ETF's history allows.
+
+### Example instruments block (common leveraged ETFs)
+
+```json
+"instruments": [
+  { "ticker": "SSO",  "base": "SPY", "leverage": 2, "mer": 0.0089 },
+  { "ticker": "UPRO", "base": "SPY", "leverage": 3, "mer": 0.0091 },
+  { "ticker": "TMF",  "base": "TLT", "leverage": 3, "mer": 0.0093 },
+  { "ticker": "UGL",  "base": "GLD", "leverage": 2, "mer": 0.0095 },
+  { "ticker": "TQQQ", "base": "QQQ", "leverage": 3, "mer": 0.0086 },
+  { "ticker": "QLD",  "base": "QQQ", "leverage": 2, "mer": 0.0095 },
+  { "ticker": "SPXL", "base": "SPY", "leverage": 3, "mer": 0.0102 }
+]
+```
+
+Any ticker not listed in `instruments` is downloaded directly from Yahoo Finance.
 
 ---
 
