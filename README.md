@@ -141,6 +141,8 @@ The daily-reset NAV model used for synthetic data:
 daily_return = L × base_return − 0.5 × (L² − L) × variance_20d − MER/252
 ```
 
+**MER is only applied during the synthetic period (before the ETF's inception date).** After inception, real market prices from Yahoo Finance are used directly — those prices already have the MER baked into the ETF's NAV. This applies equally to leveraged and non-leveraged ETFs: recording `mer` for a normal ETF like SPY is purely informational and has no effect on the simulation.
+
 Real prices are used from the ETF's inception date onward. Synthetic data fills in every day before that, going as far back as the base ETF's history allows.
 
 ### Example instruments block (common leveraged ETFs)
