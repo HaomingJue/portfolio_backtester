@@ -14,6 +14,24 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Interactive UI (recommended)
+
+```bash
+streamlit run app.py
+```
+
+Opens a browser dashboard:
+
+- pick preset portfolios from `portfolios.json` and/or type custom ones
+  (`My 60/40 = SPY:0.6, TLT:0.4` — one per line),
+- adjust start/end dates, capital, and rebalance frequency with widgets,
+- get the summary stats table, log-scale growth chart, drawdown chart, and
+  color-coded annual returns table live; price data is cached for an hour.
+
+Synthetic pre-inception leveraged NAV (SSO, UPRO, TQQQ, QLD, TMF, …) works
+exactly as in the CLI — it is read from the `instruments` section of
+`portfolios.json`.
+
 ### Config mode — compare multiple portfolios from a JSON file
 
 ```bash
