@@ -2,4 +2,8 @@ yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.7
-streamlit>=1.40   # interactive UI: streamlit run app.py
+streamlit>=1.50   # interactive UI: streamlit run app.py
+
+# Optional — only needed to build the standalone .exe (see build_exe.bat).
+# Install with: pip install pyinstaller
+# pyinstaller>=6.0

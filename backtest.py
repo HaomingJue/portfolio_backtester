@@ -178,6 +178,98 @@ def download_prices(
 
 
 # ---------------------------------------------------------------------------
+# Single-ticker lookup (Yahoo-Finance-style overview for the UI)
+# ---------------------------------------------------------------------------
+
+def ticker_has_data(symbol: str) -> bool:
+    """Cheap existence check: True if Yahoo returns any recent price for `symbol`."""
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return False
+    try:
+        hist = yf.Ticker(symbol).history(period="5d")
+        return hist is not None and not hist.empty
+    except Exception:
+        return False
+
+
+def fetch_ticker_overview(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    period: str | None = None,
+) -> dict:
+    """Fetch a single ticker's price history plus key stats, like a Yahoo Finance
+    quote page. Provide either `period` (e.g. "1y", "max") or `start`/`end` dates.
+
+    Raises ValueError if the symbol returns no data (doesn't exist / delisted).
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        raise ValueError("Enter a ticker symbol.")
+
+    tk = yf.Ticker(symbol)
+    if period:
+        hist = tk.history(period=period, auto_adjust=False)
+    else:
+        hist = tk.history(start=start, end=end, auto_adjust=False)
+
+    if hist is None or hist.empty:
+        raise ValueError(
+            f"No data found for '{symbol}'. The symbol may be misspelled or delisted."
+        )
+
+    # fast_info is quick and reliable; .info is richer but slower and may fail.
+    fast = {}
+    try:
+        fast = dict(tk.fast_info)
+    except Exception:
+        fast = {}
+    info = {}
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+
+    close = hist["Close"].dropna()
+    last  = float(close.iloc[-1])
+    prev  = float(close.iloc[-2]) if len(close) > 1 else last
+    change     = last - prev
+    change_pct = (change / prev) if prev else 0.0
+
+    def pick(*vals):
+        for v in vals:
+            if v not in (None, "", 0):
+                return v
+        return None
+
+    return {
+        "symbol":         symbol,
+        "name":           pick(info.get("longName"), info.get("shortName"), symbol),
+        "currency":       pick(fast.get("currency"), info.get("currency"), "USD"),
+        "exchange":       pick(fast.get("exchange"), info.get("fullExchangeName"),
+                               info.get("exchange"), "—"),
+        "sector":         pick(info.get("sector"), "—"),
+        "industry":       pick(info.get("industry"), "—"),
+        "price":          last,
+        "prev_close":     prev,
+        "change":         change,
+        "change_pct":     change_pct,
+        "market_cap":     pick(fast.get("market_cap"), info.get("marketCap")),
+        "pe":             pick(info.get("trailingPE")),
+        "forward_pe":     pick(info.get("forwardPE")),
+        "dividend_yield": pick(info.get("dividendYield")),
+        "year_high":      pick(fast.get("year_high"), info.get("fiftyTwoWeekHigh")),
+        "year_low":       pick(fast.get("year_low"), info.get("fiftyTwoWeekLow")),
+        "day_high":       pick(fast.get("day_high"), info.get("dayHigh")),
+        "day_low":        pick(fast.get("day_low"), info.get("dayLow")),
+        "volume":         pick(fast.get("last_volume"), info.get("volume")),
+        "summary":        info.get("longBusinessSummary") or "",
+        "history":        hist,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Config file
 # ---------------------------------------------------------------------------
 

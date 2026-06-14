@@ -1,0 +1,15 @@
+[global]
+developmentMode = false
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = false
+fileWatcherType = "none"
+
+[runner]
+fastReruns = true
+
+[theme]
+base = "light"
