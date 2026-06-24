@@ -2,11 +2,14 @@
 """
 backtest.py — general-purpose multi-asset portfolio backtester
 
+All prices come straight from Yahoo Finance — there is no synthetic/modeled
+history. A holding that hadn't launched yet at the backtest start is simply held
+as cash until its first trading day (see simulate_with_cash).
+
 Two modes:
 
   Single-portfolio mode (--portfolio):
     Compare one portfolio against benchmark tickers.
-    Note: synthetic leveraged ETF NAV requires --config mode.
 
     python backtest.py --portfolio SPY:0.60 TLT:0.40
     python backtest.py --portfolio SPY:0.25 TLT:0.25 GLD:0.25 SHY:0.25 --start 2007-01-01
@@ -15,7 +18,6 @@ Two modes:
 
   Config mode (--config):
     Compare any number of named portfolios defined in a JSON file.
-    Define synthetic leveraged ETFs in the "instruments" section.
 
     python backtest.py --config portfolios.json
     python backtest.py --config my_custom.json --start 2015-01-01
@@ -27,22 +29,11 @@ Two modes:
         "capital": 10000,           // optional, overridden by --initial
         "rebalance": "quarterly",   // optional, overridden by --rebalance
 
-        "instruments": [
-          { "ticker": "SSO",  "base": "SPY", "leverage": 2, "mer": 0.0089 },
-          { "ticker": "TMF",  "base": "TLT", "leverage": 3, "mer": 0.0093 }
-        ],
-
         "portfolios": [
-          { "name": "HFEA", "weights": {"SSO": 0.55, "TMF": 0.45}, "color": "crimson" },
+          { "name": "60/40", "weights": {"SPY": 0.6, "TLT": 0.4}, "color": "crimson" },
           { "name": "SPY B&H", "weights": {"SPY": 1.0}, "color": "gray" }
         ]
       }
-
-    Each entry in "instruments" tells the backtester to build synthetic pre-inception
-    NAV for that ticker using a daily-reset model:
-      daily_return = L * base_return - 0.5*(L^2 - L)*variance_20d - MER/252
-    Real prices are used from the ETF's first trading day onward; synthetic data
-    fills in every day before that, going all the way back to the base ETF's history.
 
 Arguments:
   --portfolio   TICKER:WEIGHT pairs (weights must sum to ~1.0)
@@ -79,7 +70,7 @@ warnings.filterwarnings("ignore")
 
 
 # ---------------------------------------------------------------------------
-# Synthetic leveraged ETF NAV
+# Data
 # ---------------------------------------------------------------------------
 
 AUTO_COLORS = [
@@ -88,39 +79,6 @@ AUTO_COLORS = [
     "#3F51B5", "#00BCD4",
 ]
 
-
-def _synthetic_lev(base: pd.Series, real: pd.Series | None, L: int, annual_mer: float) -> pd.Series:
-    ret       = base.pct_change().fillna(0)
-    var20     = ret.rolling(20).var().fillna(0)
-    daily_mer = annual_mer / 252.0
-
-    first_real = None
-    if real is not None and not real.dropna().empty:
-        common = base.index.intersection(real.dropna().index)
-        if not common.empty:
-            first_real = base.index.get_loc(common[0])
-
-    nav = np.ones(len(base))
-    for i in range(1, len(base)):
-        r = L * ret.values[i] - 0.5 * (L**2 - L) * var20.values[i]
-        if first_real is None or i < first_real:
-            r -= daily_mer
-        nav[i] = nav[i - 1] * (1.0 + r)
-
-    synth = pd.Series(nav, index=base.index, name=base.name)
-    if first_real is None:
-        return synth
-
-    anchor   = base.index[first_real]
-    stitched = synth.copy()
-    real_aln = real.reindex(base.index)
-    stitched.loc[anchor:] = real_aln.loc[anchor:] * (synth.loc[anchor] / real.loc[anchor])
-    return stitched
-
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
 
 def _dl(ticker: str, start: str, end: str) -> pd.Series:
     try:
@@ -136,44 +94,30 @@ def download_prices(
     tickers: list[str],
     start: str,
     end: str,
-    synth_tickers: dict | None = None,
+    require_all: bool = True,
 ) -> pd.DataFrame:
-    """Download price data, building synthetic pre-inception NAV for any ticker
-    defined in synth_tickers (parsed from the JSON "instruments" section).
+    """Download adjusted-close prices for `tickers` from Yahoo Finance.
 
-    synth_tickers format: {"SSO": {"base": "SPY", "L": 2, "mer": 0.0089}, ...}
+    Every column keeps its real history only: the leading days before a ticker's
+    first trade stay NaN (so callers can decide what to do with pre-inception
+    gaps — e.g. simulate_with_cash holds them as cash).
+
+    require_all=True  → raise ValueError if any requested ticker has no data.
+    require_all=False → missing tickers become all-NaN columns instead.
     """
-    if synth_tickers is None:
-        synth_tickers = {}
-
-    all_tickers  = sorted(set(tickers))
-    synth_set    = {t for t in all_tickers if t in synth_tickers}
-    base_needed  = {synth_tickers[t]["base"] for t in synth_set}
-    direct_set   = (set(all_tickers) - synth_set) | base_needed
-
-    # Pull extra history for the 20-day rolling variance used in synthetic model
-    dl_start = (pd.Timestamp(start) - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
-
-    print(f"Downloading {', '.join(sorted(direct_set))} …")
-    raw_series = {t: _dl(t, dl_start, end) for t in sorted(direct_set)}
-
-    for tk in sorted(synth_set):
-        spec = synth_tickers[tk]
-        base = raw_series.get(spec["base"])
-        if base is not None and not base.empty:
-            real = _dl(tk, dl_start, end)
-            raw_series[tk] = _synthetic_lev(base, real, spec["L"], spec["mer"])
-            real_start = real.dropna().index[0].strftime("%Y-%m-%d") if not real.dropna().empty else "no real data"
-            print(f"  Built synthetic NAV for {tk} (real data from {real_start})")
-        else:
-            print(f"  WARNING: base {spec['base']} unavailable — cannot build {tk}")
+    all_tickers = sorted(set(tickers))
+    print(f"Downloading {', '.join(all_tickers)} …")
+    raw_series = {t: _dl(t, start, end) for t in all_tickers}
 
     df = pd.DataFrame(raw_series)
     df = df[df.index >= start].ffill()
 
     missing = [t for t in tickers if t not in df.columns or df[t].isna().all()]
     if missing:
-        raise ValueError(f"No price data for: {', '.join(missing)}")
+        if require_all:
+            raise ValueError(f"No price data for: {', '.join(missing)}")
+        for t in missing:
+            df[t] = np.nan
     return df
 
 
@@ -269,15 +213,46 @@ def fetch_ticker_overview(
     }
 
 
+def fetch_ticker_meta(symbol: str) -> dict:
+    """Lightweight name / sector / price lookup used by the composition and
+    sector-breakdown charts. No price history is downloaded.
+
+    Sector is "—" for funds (ETFs hold many sectors); callers may group those
+    under a label like "ETF / Other".
+    """
+    symbol = (symbol or "").strip().upper()
+    tk = yf.Ticker(symbol)
+    info = {}
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    price = None
+    try:
+        price = float(dict(tk.fast_info).get("last_price"))
+    except Exception:
+        price = None
+
+    quote_type = (info.get("quoteType") or "").upper()
+    sector = info.get("sector")
+    if not sector:
+        sector = "ETF / Fund" if quote_type in ("ETF", "MUTUALFUND") else "—"
+
+    return {
+        "symbol":     symbol,
+        "name":       info.get("longName") or info.get("shortName") or symbol,
+        "sector":     sector,
+        "quote_type": quote_type or "—",
+        "price":      price,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Config file
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> tuple:
-    """Return (portfolios_dict, colors_dict, rebalance_map, synth_tickers, start, end, capital, rebalance).
-
-    synth_tickers: dict built from the JSON "instruments" array, keyed by ticker symbol.
-      e.g. {"SSO": {"base": "SPY", "L": 2, "mer": 0.0089}}
+    """Return (portfolios_dict, colors_dict, rebalance_map, start, end, capital, rebalance).
 
     rebalance_map: per-portfolio overrides, e.g. {"SPY B&H": "none"}.
     Falls back to the top-level "rebalance" value (or CLI flag) for portfolios
@@ -287,20 +262,6 @@ def load_config(path: str) -> tuple:
     portfolios:    dict[str, dict] = {}
     colors:        dict[str, str]  = {}
     rebalance_map: dict[str, str]  = {}
-    synth_tickers: dict[str, dict] = {}
-
-    # Parse instruments.
-    # - Has base + leverage + mer  →  synthetic pre-inception NAV is built.
-    # - Has only mer (no base/leverage)  →  downloaded directly from Yahoo; mer is informational.
-    # - Not listed at all  →  downloaded directly from Yahoo.
-    for inst in data.get("instruments", []):
-        tk = inst["ticker"].upper()
-        if "base" in inst and "leverage" in inst and "mer" in inst:
-            synth_tickers[tk] = {
-                "base": inst["base"].upper(),
-                "L":    inst["leverage"],
-                "mer":  inst["mer"],
-            }
 
     # Parse portfolios
     entries = data.get("portfolios", {})
@@ -325,7 +286,6 @@ def load_config(path: str) -> tuple:
         portfolios,
         colors,
         rebalance_map,
-        synth_tickers,
         data.get("start"),
         data.get("end"),
         data.get("capital"),
@@ -377,6 +337,88 @@ def simulate(
             holding = w * total
 
     return pd.Series(values, index=p.index, name="value")
+
+
+def simulate_with_cash(
+    prices: pd.DataFrame,
+    weights: dict[str, float],
+    rebalance: str = "monthly",
+    initial: float = 10_000,
+) -> tuple[pd.Series, dict]:
+    """Backtest over the *full* date range of `prices`, holding any not-yet-launched
+    ticker as cash (0% yield) until its first trading day.
+
+    Unlike simulate(), this does not push the start forward to the latest
+    inception date. A ticker contributes only once it actually trades; before
+    that its target weight sits in cash, and gets invested at its launch day
+    (and at every rebalance thereafter). If `weights` sum to less than 1.0 the
+    remainder is permanently held as cash too — so any proportion is allowed.
+
+    Returns (values, deferred) where `deferred` maps ticker -> first available
+    Timestamp (or None if it never traded in range) for every holding that was
+    not yet available on the first day. Use it to warn the user.
+    """
+    tickers = list(weights.keys())
+    if not tickers or prices.empty:
+        return pd.Series(dtype=float, name="value"), {}
+
+    p = prices.reindex(columns=tickers)
+    p = p[~p.index.duplicated(keep="first")].sort_index()
+    idx = p.index
+    n = len(idx)
+    if n == 0:
+        return pd.Series(dtype=float, name="value"), {}
+
+    w = np.array([float(weights[t]) for t in tickers], dtype=float)
+    cash_w = max(0.0, 1.0 - float(w.sum()))     # explicit leftover-as-cash bucket
+
+    # Monotonic availability: once a ticker has traded it stays "available"
+    # (a mid-series data gap shouldn't sell it to cash).
+    avail = np.zeros((n, len(tickers)), dtype=bool)
+    deferred: dict = {}
+    for j, t in enumerate(tickers):
+        fv = p[t].first_valid_index()
+        if fv is None:
+            deferred[t] = None                  # never traded in range → cash throughout
+            continue
+        pos = idx.get_loc(fv)
+        avail[pos:, j] = True
+        if pos > 0:
+            deferred[t] = fv                    # launched after the chosen start
+
+    rets = p.ffill().pct_change().fillna(0.0).values
+    rebal_dates = _period_first_dates(idx, rebalance)
+    rebal_mask = np.array([dt in rebal_dates for dt in idx])
+
+    holding = np.zeros(len(tickers))
+    av0 = avail[0]
+    holding[av0] = w[av0] * initial
+    cash = (cash_w + float(w[~av0].sum())) * initial    # leftover + not-yet-launched
+
+    prev_av = av0.copy()
+    values = np.empty(n)
+    for i in range(n):
+        if i > 0:
+            av_i = avail[i]
+            grow = av_i & prev_av
+            holding[grow] *= (1.0 + rets[i][grow])
+            total = holding.sum() + cash
+            new_av = av_i & ~prev_av            # tickers launching today
+            if new_av.any() and cash > 0:
+                want = w[new_av] * total
+                tot_want = float(want.sum())
+                if tot_want > cash:             # not enough reserved cash → scale down
+                    want = want * (cash / tot_want)
+                holding[new_av] += want
+                cash -= float(want.sum())
+            prev_av = av_i.copy()
+        values[i] = holding.sum() + cash
+        if i > 0 and rebal_mask[i]:
+            total = values[i]
+            holding = np.where(prev_av, w * total, 0.0)
+            cash = total - holding.sum()        # leftover + still-unlaunched weight
+
+    return pd.Series(values, index=idx, name="value"), deferred
 
 
 # ---------------------------------------------------------------------------
@@ -700,19 +742,15 @@ def main() -> int:
 
     # ── Build portfolio list ──────────────────────────────────────────────
     if args.config:
-        portfolios, color_map, rebalance_map, synth_tickers, cfg_start, cfg_end, cfg_capital, cfg_rebalance = load_config(args.config)
+        portfolios, color_map, rebalance_map, cfg_start, cfg_end, cfg_capital, cfg_rebalance = load_config(args.config)
         start     = args.start    or cfg_start    or "2003-01-01"
         end       = args.end      or cfg_end      or date.today().isoformat()
         initial   = args.initial  or cfg_capital  or 10_000
         rebalance = args.rebalance or cfg_rebalance or "quarterly"
-        if synth_tickers:
-            inst_summary = ", ".join(f"{t} ({v['L']}x {v['base']})" for t, v in synth_tickers.items())
-            print(f"Instruments: {inst_summary}")
         print(f"Loaded {len(portfolios)} portfolio(s) from {args.config}")
         all_tickers = list({t for w in portfolios.values() for t in w})
     else:
         rebalance_map = {}
-        synth_tickers = {}
         try:
             port_weights = parse_portfolio(args.portfolio)
         except ValueError as e:
@@ -736,7 +774,7 @@ def main() -> int:
 
     # ── Download data ─────────────────────────────────────────────────────
     try:
-        prices = download_prices(all_tickers, start, end, synth_tickers)
+        prices = download_prices(all_tickers, start, end)
     except Exception as e:
         print(f"ERROR downloading data: {e}", file=sys.stderr)
         return 1

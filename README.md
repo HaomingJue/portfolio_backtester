@@ -20,31 +20,34 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opens a browser dashboard with three tabs:
+Opens a browser dashboard with two pages (left sidebar):
 
-**🔍 Explore ticker** — search *any* symbol (stocks, ETFs, `BTC-USD`, …) and see
-it Yahoo-Finance style: last price with daily change, market cap, P/E, dividend
-yield, 52-week range, a price + volume chart, and the company summary. Pick a
-period (1M / 6M / YTD / 1Y / 5Y / Max / custom dates). Unknown symbols show a
-clear error. Hit **➕ Add to portfolio** to drop it into the builder.
+**🛠️ Build & backtest** — everything for one portfolio on a single page:
 
-**🛠️ Build & Save** — assemble a portfolio by giving each ticker a percentage in
-an editable grid. It shows the running total, a **Normalize to 100%** button, a
-one-click **Backtest this portfolio now**, and **💾 Save** (validates every
-ticker, then writes to `saved_portfolios.json`). Saved portfolios can be deleted
-from the same tab.
+1. *Find a stock* — search *any* symbol (stocks, ETFs, `BTC-USD`, …) and see it
+   Yahoo-Finance style: price with daily change, market cap, P/E, dividend yield,
+   52-week range, and a price chart over a chosen period. Hit
+   **➕ Add … to portfolio**.
+2. *Your portfolio* — give each holding any weight in an editable grid. Whatever
+   you leave under 100% is held as **cash** (any proportion is allowed). Name it
+   and hit **💾 Save** (validates every ticker, then writes to
+   `saved_portfolios.json`).
+3. *Composition* — a pie + bar of the current allocation (cash included) and a
+   **sector breakdown** of the holdings.
+4. *Backtest* — run it over **any** date range (sidebar settings), optionally
+   versus the S&P 500. Summary stats, log-scale growth chart, drawdown chart, and
+   a color-coded annual-returns table.
 
-**📊 Backtest** — compare any mix of preset (`portfolios.json`), saved
-(`saved_portfolios.json`), and quick-typed custom portfolios over the chosen
-period. Summary stats table, log-scale growth chart, drawdown chart, and a
-color-coded annual-returns table. Price data is cached for an hour.
+**📂 Saved portfolios** — the list of everything you've saved. Pick one to see
+its holdings table (ticker, name, sector, weight) and composition, then
+**✏️ Load into builder** to drop it back onto the build page, or **🗑️ Delete** it.
 
-Start/end dates, capital, and rebalance frequency live in the left sidebar and
-apply to the Build and Backtest tabs.
+Start/end dates, capital, and rebalance frequency live in the left sidebar.
 
 All prices come straight from Yahoo Finance — there is no synthetic/modeled
-history. A backtest automatically begins on the latest inception date among its
-holdings (e.g. a portfolio holding a 2010-launched ETF starts in 2010).
+history. A holding that hadn't launched yet at the chosen start is simply held as
+cash until its first trading day, and the app tells you which ones and from when
+(e.g. start a 2010 backtest holding TSLA and it sits in cash until 2010-06-29).
 
 ### Config mode — compare multiple portfolios from a JSON file
 
@@ -180,8 +183,8 @@ This installs PyInstaller if needed and builds from `portfolio_backtester.spec`.
 The result is a **single file**: `dist\PortfolioBacktester.exe` — send your
 friend just that one file. They double-click it; a console window opens, the
 first launch takes ~20–40 s while it unpacks, then a browser tab opens with the
-app. User-saved portfolios (`saved_portfolios.json`) and the editable
-`portfolios.json` are written next to the .exe so they persist.
+app. User-saved portfolios (`saved_portfolios.json`) are written next to the .exe
+so they persist between runs.
 
 Notes / caveats:
 
